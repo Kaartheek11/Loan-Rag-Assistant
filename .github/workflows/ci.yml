@@ -45,7 +45,9 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --frozen
       - name: pip-audit
-        run: uv export --frozen --no-hashes --format requirements-txt > /tmp/req.txt && uv run pip-audit -r /tmp/req.txt --disable-pip
+        run: |
+          uv export --frozen --no-emit-project --format requirements-txt > /tmp/req.txt
+          uv run pip-audit -r /tmp/req.txt --disable-pip
 
   gitleaks:
     runs-on: ubuntu-24.04
