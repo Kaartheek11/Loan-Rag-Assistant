@@ -1,0 +1,32 @@
+# TLS reverse proxy (S3). Only the API is routed; Keycloak's admin console is never
+# exposed through Caddy (S15) — Keycloak is reachable on 127.0.0.1:8080 only.
+#
+# For a real host name, replace `localhost` with it and Caddy obtains a certificate.
+# `localhost` uses Caddy's internal CA (trust it with `caddy trust`, or curl -k in dev).
+{
+	admin off
+}
+
+localhost {
+	encode gzip
+
+	@api path /v1/* /health /docs /openapi.json
+	handle @api {
+		reverse_proxy api:8000
+	}
+
+	handle {
+		respond "not found" 404
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+}
+
+http://localhost {
+	redir https://{host}{uri} permanent
+}

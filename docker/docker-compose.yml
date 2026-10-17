@@ -1,0 +1,90 @@
+# Single-host stack (spec §7). Run from the repo root:
+#   docker compose -f docker/docker-compose.yml --env-file .env up -d
+# Image versions are pinned (S14).
+name: loanrag
+
+services:
+  postgres:
+    image: postgres:16.4
+    environment:
+      POSTGRES_DB: loanrag
+      POSTGRES_USER: loanrag_owner
+      POSTGRES_PASSWORD: ${POSTGRES_OWNER_PASSWORD:?set POSTGRES_OWNER_PASSWORD}
+      APP_DB_ROLE: ${APP_DB_ROLE:-loanrag_app}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?set APP_DB_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init-app-role.sh:/docker-entrypoint-initdb.d/10-app-role.sh:ro
+    ports:
+      - "127.0.0.1:5432:5432"   # localhost only (dev convenience for the CLI)
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U loanrag_owner -d loanrag"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0.7
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?set KEYCLOAK_ADMIN_PASSWORD}
+      # Fixed public URL so the token `iss` is the same no matter which host name
+      # the client used; the API fetches JWKS over the internal network.
+      KC_HOSTNAME: http://localhost:8080
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+      KC_HTTP_ENABLED: "true"
+      KC_HEALTH_ENABLED: "true"
+      DEV_USER_PASSWORD: ${DEV_USER_PASSWORD:?set DEV_USER_PASSWORD}
+    volumes:
+      - ./keycloak/realm-loanrag.json:/opt/keycloak/data/import/realm-loanrag.json:ro
+    ports:
+      # Bound to localhost only; the admin console is never routed through Caddy (S15).
+      - "127.0.0.1:8080:8080"
+
+  ollama:
+    image: ollama/ollama:0.5.7
+    volumes:
+      - ollama:/root/.ollama
+    ports:
+      - "127.0.0.1:11434:11434"
+
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    env_file: ../.env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${APP_DB_ROLE:-loanrag_app}:${APP_DB_PASSWORD}@postgres:5432/loanrag
+      MIGRATION_DATABASE_URL: postgresql+psycopg://loanrag_owner:${POSTGRES_OWNER_PASSWORD}@postgres:5432/loanrag
+      JWKS_URL: http://keycloak:8080/realms/loanrag/protocol/openid-connect/certs
+      JWT_ISSUER: http://localhost:8080/realms/loanrag
+      OLLAMA_BASE_URL: http://ollama:11434
+      FAISS_INDEX_PATH: /data/index.faiss
+      DOCUMENT_STORE_PATH: /data/documents
+    volumes:
+      - appdata:/data
+      - ../corpus:/corpus:ro
+      - ../config:/app/config:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      keycloak:
+        condition: service_started
+
+  caddy:
+    image: caddy:2.8.4
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
+  ollama:
+  appdata:
+  caddy_data:

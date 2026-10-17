@@ -1,0 +1,27 @@
+# secrets
+.env
+keys/
+
+# generated data
+data/
+corpus/
+eval/results/
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# graphify
+graphify-out/
+
+# os / editors
+.DS_Store
+.idea/
+.vscode/

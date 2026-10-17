@@ -1,0 +1,12 @@
+# macOS override: use Ollama running natively on the host (Metal GPU) instead of the
+# CPU-only Ollama container (Docker on macOS has no GPU access; an 8B model on CPU inside
+# the Docker VM is far too slow). Run `ollama serve` on the host first, then:
+#
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.host-ollama.yml \
+#     --env-file .env up -d
+services:
+  api:
+    environment:
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+  ollama:
+    profiles: ["container-ollama"]  # not started unless this profile is requested

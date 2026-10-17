@@ -1,0 +1,166 @@
+{
+  "realm": "loanrag",
+  "enabled": true,
+  "sslRequired": "external",
+  "accessTokenLifespan": 900,
+  "registrationAllowed": false,
+  "clients": [
+    {
+      "clientId": "loanrag-api",
+      "name": "Loan RAG API",
+      "enabled": true,
+      "publicClient": true,
+      "protocol": "openid-connect",
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "http://localhost:8000/*",
+        "https://localhost/*"
+      ],
+      "webOrigins": [
+        "+"
+      ],
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      },
+      "protocolMappers": [
+        {
+          "name": "audience-loanrag-api",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "loanrag-api",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "id": "u_alice",
+      "username": "alice",
+      "enabled": true,
+      "email": "alice@example.test",
+      "emailVerified": true,
+      "firstName": "Alice",
+      "lastName": "Underwriter",
+      "realmRoles": [
+        "default-roles-loanrag"
+      ]
+    },
+    {
+      "id": "u_bob",
+      "username": "bob",
+      "enabled": true,
+      "email": "bob@example.test",
+      "emailVerified": true,
+      "firstName": "Bob",
+      "lastName": "Servicing",
+      "realmRoles": [
+        "default-roles-loanrag"
+      ]
+    },
+    {
+      "id": "u_carol",
+      "username": "carol",
+      "enabled": true,
+      "email": "carol@example.test",
+      "emailVerified": true,
+      "firstName": "Carol",
+      "lastName": "Compliance",
+      "realmRoles": [
+        "default-roles-loanrag"
+      ]
+    },
+    {
+      "id": "u_dana",
+      "username": "dana",
+      "enabled": true,
+      "email": "dana@example.test",
+      "emailVerified": true,
+      "firstName": "Dana",
+      "lastName": "Servicing",
+      "realmRoles": [
+        "default-roles-loanrag"
+      ]
+    },
+    {
+      "id": "u_erin",
+      "username": "erin",
+      "enabled": true,
+      "email": "erin@example.test",
+      "emailVerified": true,
+      "firstName": "Erin",
+      "lastName": "Executive",
+      "realmRoles": [
+        "default-roles-loanrag"
+      ]
+    },
+    {
+      "id": "u_frank",
+      "username": "frank",
+      "enabled": true,
+      "email": "frank@example.test",
+      "emailVerified": true,
+      "firstName": "Frank",
+      "lastName": "Underwriter",
+      "realmRoles": [
+        "default-roles-loanrag"
+      ]
+    },
+    {
+      "id": "u_grace",
+      "username": "grace",
+      "enabled": true,
+      "email": "grace@example.test",
+      "emailVerified": true,
+      "firstName": "Grace",
+      "lastName": "Western",
+      "realmRoles": [
+        "default-roles-loanrag"
+      ]
+    },
+    {
+      "id": "u_henry",
+      "username": "henry",
+      "enabled": true,
+      "email": "henry@example.test",
+      "emailVerified": true,
+      "firstName": "Henry",
+      "lastName": "NoGroups",
+      "realmRoles": [
+        "default-roles-loanrag"
+      ]
+    },
+    {
+      "id": "u_ivan",
+      "username": "ivan",
+      "enabled": true,
+      "email": "ivan@example.test",
+      "emailVerified": true,
+      "firstName": "Ivan",
+      "lastName": "Compliance",
+      "realmRoles": [
+        "default-roles-loanrag"
+      ]
+    },
+    {
+      "id": "u_admin",
+      "username": "admin",
+      "enabled": true,
+      "email": "admin@example.test",
+      "emailVerified": true,
+      "firstName": "Ada",
+      "lastName": "Admin",
+      "realmRoles": [
+        "default-roles-loanrag"
+      ]
+    }
+  ]
+}
