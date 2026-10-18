@@ -19,6 +19,8 @@ _CODES = {
     403: "forbidden",
     404: "not_found",
     405: "method_not_allowed",
+    409: "conflict",
+    413: "file_too_large",
     422: "validation_error",
     429: "rate_limited",
     503: "unavailable",
@@ -26,19 +28,24 @@ _CODES = {
 
 
 class ApiError(Exception):
-    def __init__(self, status: int, code: str) -> None:
+    def __init__(self, status: int, code: str, extra: dict[str, str] | None = None) -> None:
         self.status = status
         self.code = code
+        self.extra = extra or {}
 
 
-def error_response(status: int, code: str | None = None) -> JSONResponse:
-    return JSONResponse({"error": code or _CODES.get(status, "error")}, status_code=status)
+def error_response(
+    status: int, code: str | None = None, extra: dict[str, str] | None = None
+) -> JSONResponse:
+    # Only the duplicate-upload error carries an extra field (extension.md §6.1 rule 7).
+    body = {"error": code or _CODES.get(status, "error"), **(extra or {})}
+    return JSONResponse(body, status_code=status)
 
 
 def install_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(ApiError)
     async def _api_error(request: Request, exc: ApiError) -> JSONResponse:
-        return error_response(exc.status, exc.code)
+        return error_response(exc.status, exc.code, exc.extra)
 
     @app.exception_handler(RequestValidationError)
     async def _validation(request: Request, exc: RequestValidationError) -> JSONResponse:

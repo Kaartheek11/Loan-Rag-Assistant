@@ -27,7 +27,7 @@ def get_identity(
         raise ApiError(401, "unauthorized")
     state = request.app.state
     try:
-        user_id = state.verifier.verify(token.strip())
+        user_id, token_id = state.verifier.verify_with_token_id(token.strip())
     except AuthError:
         raise ApiError(401, "unauthorized") from None
     with state.engine.connect() as conn:
@@ -35,6 +35,7 @@ def get_identity(
     if identity is None:
         raise ApiError(401, "unauthorized")
     request.state.identity = identity
+    request.state.token_id = token_id
     return identity
 
 

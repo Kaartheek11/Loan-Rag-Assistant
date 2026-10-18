@@ -7,6 +7,7 @@ adapter. Production refuses unsafe configs (fake LLM, static test keys, missing 
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -18,10 +19,10 @@ from slowapi import Limiter
 from sqlalchemy import Engine, text
 from starlette.concurrency import run_in_threadpool
 
-from app.api import routes_admin, routes_documents, routes_query
+from app.api import routes_admin, routes_documents, routes_me, routes_query
 from app.api.errors import install_error_handlers
 from app.api.schemas import HealthResponse
-from app.audit.audit_log import AuditLogger
+from app.audit.audit_log import AuditLogger, SessionStartRecorder
 from app.config import ConfigError, Settings, get_settings
 from app.db.seed import ensure_index_state, read_index_state
 from app.db.session import make_engine
@@ -67,7 +68,9 @@ def create_app(
         emb: Embedder = (
             embedder
             if embedder is not None
-            else await run_in_threadpool(Embedder, settings.embedding_model)
+            else await run_in_threadpool(
+                Embedder, settings.embedding_model, settings.embedding_device
+            )
         )
         if emb.model_name != settings.embedding_model:
             raise StartupError("embedder does not match EMBEDDING_MODEL")
@@ -98,12 +101,15 @@ def create_app(
             jwks_url=settings.jwks_url,
             public_key_path=settings.jwt_public_key_path,
         )
+        audit = AuditLogger(db, key)
+        app.state.audit = audit
+        app.state.session_starts = SessionStartRecorder(audit)
         app.state.query_service = QueryService(
             engine=db,
             embedder=emb,
             index=holder,
             llm=adapter,
-            audit=AuditLogger(db, key),
+            audit=audit,
             n_start=settings.retrieval_n_start,
             n_max=settings.retrieval_n_max,
         )
@@ -121,11 +127,25 @@ def create_app(
     limiter = Limiter(key_func=_user_key, strategy="moving-window", storage_uri="memory://")
     app.state.limiter = limiter
     install_error_handlers(app)
+
+    @app.middleware("http")
+    async def api_headers(request: Request, call_next: Any) -> Any:
+        """UI-S9: API responses (answers, page text, errors) are never cached by browsers.
+        Every /v1 response also carries X-Request-Id, so the UI can attach it to error cards
+        for debugging (UI-F12) without adding anything to the {"error": ...} body."""
+        request.state.request_id = str(uuid.uuid4())
+        response = await call_next(request)
+        if request.url.path.startswith("/v1/"):
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["X-Request-Id"] = request.state.request_id
+        return response
+
     app.include_router(
         routes_query.build_router(limiter, f"{settings.rate_limit_per_minute}/minute")
     )
+    app.include_router(routes_me.router)
     app.include_router(routes_documents.router)
-    app.include_router(routes_admin.router)
+    app.include_router(routes_admin.build_router(limiter))
 
     @app.get("/health", response_model=HealthResponse)
     async def health(request: Request) -> dict[str, Any]:

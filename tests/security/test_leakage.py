@@ -145,7 +145,9 @@ def test_t14_rate_limit_per_user(env) -> None:  # type: ignore[no-untyped-def]
     assert env.query("u_alice", "a different user is not limited").status_code == 200
 
 
-def test_insufficient_wording_matches_spec() -> None:
+def test_insufficient_wording_is_fixed() -> None:
+    # task.md §9.2 wording, changed by the owner (architecture D58). It is one constant, so
+    # hidden and nonexistent matches stay indistinguishable (T9 compares the full bodies).
     assert INSUFFICIENT_ANSWER == (
-        "I couldn't find information to answer that in the documents available to you."
+        "I couldn't find information to answer that in the files you have access to."
     )

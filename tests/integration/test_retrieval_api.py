@@ -198,7 +198,7 @@ def test_admin_lists_failed_documents_without_text(env, tmp_path, embedder) -> N
     ).run(src)
     r = env.client.get("/v1/admin/documents?status=failed", headers=env.headers("u_admin"))
     assert r.status_code == 200
-    rows = r.json()
+    rows = r.json()["items"]
     assert [row["filename"] for row in rows] == ["loan_bad.pdf"]
     assert rows[0]["failure_reason"].startswith("extraction_failed")
     assert (

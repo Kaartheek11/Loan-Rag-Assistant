@@ -18,6 +18,7 @@ from sqlalchemy import (
     String,
     Table,
     Text,
+    func,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, TSVECTOR, UUID
 
@@ -50,7 +51,7 @@ documents = Table(
     metadata,
     Column("doc_id", UUID(as_uuid=True), primary_key=True),
     Column("filename", Text, nullable=False),
-    Column("sha256", String(64), nullable=False, unique=True),
+    Column("sha256", String(64), nullable=False),  # unique among non-deleted rows (0005)
     Column("page_count", Integer, nullable=False),
     Column("ocr_pages", ARRAY(Integer), nullable=False),
     Column("status", Text, nullable=False),
@@ -59,6 +60,8 @@ documents = Table(
     Column("acl_users", ARRAY(Text), nullable=False),
     Column("ingested_at", DateTime(timezone=True), nullable=False),
     Column("deleted_at", DateTime(timezone=True)),
+    Column("loan_number", Text),
+    Column("borrower_name", Text),
 )
 
 pages = Table(
@@ -81,7 +84,12 @@ chunks = Table(
     Column("identifiers", ARRAY(Text), nullable=False),
     Column("acl_groups", ARRAY(Text), nullable=False),
     Column("acl_users", ARRAY(Text), nullable=False),
-    Column("tsv", TSVECTOR, Computed("to_tsvector('simple', text)", persisted=True)),
+    Column("context_prefix", Text, nullable=False, server_default=""),
+    Column(
+        "tsv",
+        TSVECTOR,
+        Computed("to_tsvector('simple', context_prefix || ' ' || text)", persisted=True),
+    ),
     Column("deleted_at", DateTime(timezone=True)),
 )
 
@@ -101,11 +109,28 @@ audit_log = Table(
     Column("ts", DateTime(timezone=True), nullable=False),
     Column("request_id", UUID(as_uuid=True), nullable=False),
     Column("user_id", Text, nullable=False),
-    Column("query_hmac", String(64), nullable=False),
-    Column("prompt_version", Text, nullable=False),
+    Column("query_hmac", String(64)),  # NULL for non-query events (BE-4)
+    Column("prompt_version", Text),
     Column("returned_chunk_ids", ARRAY(BigInteger), nullable=False),
     Column("cited_chunk_ids", ARRAY(BigInteger), nullable=False),
+    Column("status", Text),
+    Column("retrieval_rounds", SmallInteger),
+    Column("latency_ms", Integer),
+    Column("event", Text, nullable=False, server_default="query"),
+    Column("doc_id", UUID(as_uuid=True)),  # admin events: upload, acl_change, delete (BE-13)
+)
+
+upload_jobs = Table(
+    "upload_jobs",
+    metadata,
+    Column("job_id", UUID(as_uuid=True), primary_key=True),
+    Column("doc_id", UUID(as_uuid=True), ForeignKey("documents.doc_id"), nullable=False),
+    Column("uploaded_by", Text, ForeignKey("users.user_id"), nullable=False),
     Column("status", Text, nullable=False),
-    Column("retrieval_rounds", SmallInteger, nullable=False),
-    Column("latency_ms", Integer, nullable=False),
+    Column("pages_done", Integer, nullable=False, server_default="0"),
+    Column("pages_total", Integer, nullable=False),
+    Column("failure_reason", Text),
+    Column("heartbeat_at", DateTime(timezone=True)),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    Column("finished_at", DateTime(timezone=True)),
 )

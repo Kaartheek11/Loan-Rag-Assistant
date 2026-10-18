@@ -27,6 +27,16 @@ class Embedder:
         self.dim = int(dim)
         self._lock = threading.Lock()  # HF fast tokenizers are not safe to share across threads
 
+    def limit_threads(self, n: int) -> None:
+        """Cap torch's intra-op threads (no-op on macOS, which runs single-threaded; D6)."""
+        import sys
+
+        if sys.platform == "darwin":
+            return
+        import torch
+
+        torch.set_num_threads(max(1, n))
+
     def count_tokens(self, text: str) -> int:
         with self._lock:
             return len(self._tokenizer(text, add_special_tokens=False)["input_ids"])

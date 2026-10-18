@@ -13,6 +13,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from sqlalchemy import Connection, text
 
@@ -83,6 +84,16 @@ class PageText:
     filename: str
     page: int
     text: str
+    page_count: int = 0
+    section: str | None = None  # section of the page's first chunk (extension.md §8.7)
+
+
+@dataclass(frozen=True, slots=True)
+class ReadableDocument:
+    doc_id: str
+    filename: str
+    page_count: int
+    ingested_at: datetime
 
 
 # ---------------------------------------------------------------------------------------
@@ -129,11 +140,39 @@ _DOCUMENT_PREDICATE = """
 
 _READ_PAGE_SQL = text(
     f"""
-    SELECT d.doc_id, d.filename, p.page, p.text
+    SELECT d.doc_id, d.filename, d.page_count, p.page, p.text,
+           (SELECT c.section FROM chunks c
+            WHERE c.doc_id = d.doc_id AND c.page = p.page AND c.deleted_at IS NULL
+            ORDER BY c.chunk_id LIMIT 1) AS section
     FROM documents d
     JOIN pages p ON p.doc_id = d.doc_id
     WHERE {_DOCUMENT_PREDICATE}
       AND p.page = :page
+    """
+)
+
+# Readable documents for an identity (BE-1, BE-2): the same document-level predicate,
+# without the doc_id filter.
+_READABLE_DOCS_WHERE = """
+    d.status = 'indexed'
+    AND d.deleted_at IS NULL
+    AND (
+          d.acl_groups && CAST(:user_groups AS text[])
+       OR CAST(:user_id AS text) = ANY(d.acl_users)
+    )
+"""
+
+_COUNT_READABLE_SQL = text(f"SELECT count(*) FROM documents d WHERE {_READABLE_DOCS_WHERE}")
+
+_LIST_READABLE_SQL = text(
+    f"""
+    SELECT d.doc_id, d.filename, d.page_count, d.ingested_at
+    FROM documents d
+    WHERE {_READABLE_DOCS_WHERE}
+      AND (CAST(:after_name AS text) IS NULL
+           OR (d.filename, d.doc_id) > (CAST(:after_name AS text), CAST(:after_id AS uuid)))
+    ORDER BY d.filename, d.doc_id
+    LIMIT :limit
     """
 )
 
@@ -210,8 +249,42 @@ def read_page(conn: Connection, identity: Identity, doc_id: str, page: int) -> P
     if row is None:
         return None
     return PageText(
-        doc_id=str(row.doc_id), filename=str(row.filename), page=int(row.page), text=str(row.text)
+        doc_id=str(row.doc_id),
+        filename=str(row.filename),
+        page=int(row.page),
+        text=str(row.text),
+        page_count=int(row.page_count),
+        section=None if row.section is None else str(row.section),
     )
+
+
+def count_readable_documents(conn: Connection, identity: Identity) -> int:
+    """BE-1: how many documents this identity can read (indexed, not deleted, ACL match)."""
+    return int(conn.execute(_COUNT_READABLE_SQL, _identity_params(identity)).scalar_one())
+
+
+def list_readable_documents(
+    conn: Connection, identity: Identity, *, after: tuple[str, str] | None, limit: int
+) -> list[ReadableDocument]:
+    """BE-2: readable documents sorted by filename, keyset-paginated after (filename, doc_id)."""
+    params: dict[str, object] = {
+        "after_name": after[0] if after else None,
+        "after_id": _parse_uuid(after[1]) if after else None,
+        "limit": int(limit),
+        **_identity_params(identity),
+    }
+    if after is not None and params["after_id"] is None:
+        return []
+    rows = conn.execute(_LIST_READABLE_SQL, params).all()
+    return [
+        ReadableDocument(
+            doc_id=str(r.doc_id),
+            filename=str(r.filename),
+            page_count=int(r.page_count),
+            ingested_at=r.ingested_at,
+        )
+        for r in rows
+    ]
 
 
 def acl_columns(acl: Acl) -> dict[str, list[str]]:
@@ -233,3 +306,108 @@ def replace_document_acl(conn: Connection, doc_id: str, acl: Acl) -> bool:
         return False
     conn.execute(_UPDATE_CHUNK_ACL_SQL, params)
     return True
+
+
+# ---------------------------------------------------------------------------------------
+# Admin metadata (extension.md BE-9, BE-12). Never returns page or chunk text.
+# ---------------------------------------------------------------------------------------
+_DOCUMENT_ACL_SQL = text(
+    "SELECT acl_groups, acl_users FROM documents WHERE doc_id = CAST(:doc_id AS uuid)"
+)
+
+_ADMIN_LIST_SQL = text(
+    """
+    SELECT d.doc_id, d.filename, d.page_count, d.status, d.failure_reason,
+           d.acl_groups, d.acl_users, d.ingested_at,
+           j.job_id, j.status AS job_status, j.pages_done, j.pages_total,
+           j.failure_reason AS job_failure_reason, j.uploaded_by
+    FROM documents d
+    LEFT JOIN LATERAL (
+        SELECT u.* FROM upload_jobs u WHERE u.doc_id = d.doc_id
+        ORDER BY u.created_at DESC LIMIT 1
+    ) j ON true
+    WHERE d.deleted_at IS NULL
+      AND (CAST(:status AS text) IS NULL OR d.status = CAST(:status AS text))
+      AND (CAST(:pattern AS text) IS NULL OR d.filename ILIKE CAST(:pattern AS text) ESCAPE '\\')
+      AND (CAST(:after_name AS text) IS NULL
+           OR (d.filename, d.doc_id) > (CAST(:after_name AS text), CAST(:after_id AS uuid)))
+    ORDER BY d.filename, d.doc_id
+    LIMIT :limit
+    """
+)
+
+
+@dataclass(frozen=True, slots=True)
+class AdminDocument:
+    doc_id: str
+    filename: str
+    page_count: int
+    status: str
+    failure_reason: str | None
+    groups: tuple[str, ...]
+    users: tuple[str, ...]
+    ingested_at: datetime
+    job_id: str | None
+    job_status: str | None
+    pages_done: int | None
+    pages_total: int | None
+    job_failure_reason: str | None
+    uploaded_by: str | None
+
+
+def document_acl(conn: Connection, doc_id: str) -> Acl | None:
+    """The ACL stored on a document row (the upload worker copies it onto chunks)."""
+    parsed = _parse_uuid(doc_id)
+    if parsed is None:
+        return None
+    row = conn.execute(_DOCUMENT_ACL_SQL, {"doc_id": parsed}).first()
+    if row is None:
+        return None
+    return Acl.of(row.acl_groups or [], row.acl_users or [])
+
+
+def list_documents_admin(
+    conn: Connection,
+    *,
+    q: str | None,
+    status: str | None,
+    after: tuple[str, str] | None,
+    limit: int,
+) -> list[AdminDocument]:
+    """BE-12: file metadata for the admin files page, keyset-paginated by filename."""
+    pattern = None
+    if q:
+        escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped}%"
+    after_id = _parse_uuid(after[1]) if after else None
+    if after is not None and after_id is None:
+        return []
+    rows = conn.execute(
+        _ADMIN_LIST_SQL,
+        {
+            "status": status,
+            "pattern": pattern,
+            "after_name": after[0] if after else None,
+            "after_id": after_id,
+            "limit": int(limit),
+        },
+    ).all()
+    return [
+        AdminDocument(
+            doc_id=str(r.doc_id),
+            filename=str(r.filename),
+            page_count=int(r.page_count),
+            status=str(r.status),
+            failure_reason=r.failure_reason,
+            groups=tuple(r.acl_groups or ()),
+            users=tuple(r.acl_users or ()),
+            ingested_at=r.ingested_at,
+            job_id=None if r.job_id is None else str(r.job_id),
+            job_status=r.job_status,
+            pages_done=r.pages_done,
+            pages_total=r.pages_total,
+            job_failure_reason=r.job_failure_reason,
+            uploaded_by=r.uploaded_by,
+        )
+        for r in rows
+    ]

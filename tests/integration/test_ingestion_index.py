@@ -25,6 +25,8 @@ from app.retrieval.index_manager import (
 )
 from eval.synth.generate_corpus import generate
 
+MINI_DOCS = 6  # short v2 files (18-22 pages) keep the suite fast
+
 
 @pytest.fixture(scope="module")
 def mini_corpus(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
@@ -32,11 +34,13 @@ def mini_corpus(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
     dirs = {"corpus": root / "corpus", "config": root / "config", "synth": root / "synth"}
     generate(
         seed=5,
-        count=12,
+        count=MINI_DOCS,
         out_dir=dirs["corpus"],
         config_dir=dirs["config"],
         synth_dir=dirs["synth"],
-        scanned_frac=0.05,
+        min_pages=18,
+        max_pages=22,
+        scanned_doc_frac=0.34,
     )
     return dirs
 
@@ -62,7 +66,7 @@ def _counts(engine: Engine) -> dict[str, int]:
 def test_ingest_is_idempotent(app_engine, clean_db, embedder, mini_corpus, tmp_path) -> None:  # type: ignore[no-untyped-def]
     pipe = _pipeline(app_engine, embedder, mini_corpus, tmp_path)
     first = pipe.run(mini_corpus["corpus"])
-    assert len(first.processed) == 12 and not first.failed
+    assert len(first.processed) == MINI_DOCS and not first.failed
     assert first.ocr_pages > 0
     assert len(first.empty_acl) >= 1
     counts = _counts(app_engine)
@@ -70,7 +74,7 @@ def test_ingest_is_idempotent(app_engine, clean_db, embedder, mini_corpus, tmp_p
     assert index.ntotal == counts["chunks"]
 
     second = pipe.run(mini_corpus["corpus"])
-    assert len(second.skipped) == 12 and not second.processed
+    assert len(second.skipped) == MINI_DOCS and not second.processed
     assert _counts(app_engine) == counts
     assert FaissIndex.load(tmp_path / "index.faiss").ntotal == counts["chunks"]
     with app_engine.connect() as conn:
@@ -99,9 +103,9 @@ def test_crash_before_index_save_leaves_pending_then_recovers(  # type: ignore[n
     monkeypatch.undo()
 
     summary = pipe.run(mini_corpus["corpus"])
-    assert len(summary.processed) == 12
+    assert len(summary.processed) == MINI_DOCS
     counts = _counts(app_engine)
-    assert counts["documents"] == 12  # no duplicates
+    assert counts["documents"] == MINI_DOCS  # no duplicates
     with app_engine.connect() as conn:
         assert set(conn.execute(text("SELECT status FROM documents")).scalars()) == {"indexed"}
     index = FaissIndex.load(tmp_path / "index.faiss")

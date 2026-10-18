@@ -37,4 +37,6 @@ async def get_page(
         "filename": result.filename,
         "page": result.page,
         "text": result.text,
+        "page_count": result.page_count,
+        "section": result.section,
     }

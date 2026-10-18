@@ -1,6 +1,22 @@
-# API image. Build from the repo root:
-#   docker build -f docker/Dockerfile -t loanrag-api .
-FROM python:3.12.7-slim-bookworm AS base
+# Build from the repo root. Targets:
+#   api  (default for the api and worker services)  docker build -f docker/Dockerfile --target api .
+#   web  (Caddy serving the built frontend)          docker build -f docker/Dockerfile --target web .
+
+# ---- frontend build (extension.md Phase H) -------------------------------------------------
+FROM node:22.11.0-bookworm-slim AS frontend
+WORKDIR /web
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY frontend/ ./
+RUN npm run build
+
+# ---- Caddy with the production build (single origin, §11.3) --------------------------------
+FROM caddy:2.8.4 AS web
+COPY docker/Caddyfile /etc/caddy/Caddyfile
+COPY --from=frontend /web/dist /srv/frontend
+
+# ---- API / worker --------------------------------------------------------------------------
+FROM python:3.12.7-slim-bookworm AS api
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
