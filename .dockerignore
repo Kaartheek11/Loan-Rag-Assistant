@@ -1,0 +1,14 @@
+.git
+.venv
+**/__pycache__
+**/node_modules
+frontend/dist
+frontend/.e2e-state
+frontend/playwright-report
+frontend/test-results
+data
+corpus
+keys
+.env
+graphify-out
+eval/results

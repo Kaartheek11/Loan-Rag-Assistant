@@ -112,7 +112,7 @@ def test_t4_acl_change_updates_chunk_copies_and_next_query(env) -> None:  # type
     env.query("u_erin", ZEPPELIN)  # executive lost access
     assert "loan_900006.pdf" not in env.returned_docs(env.audit_rows()[-1])
     r = env.client.put(
-        f"/v1/admin/documents/{random_doc_id()}/acl", json={"groups": []}, headers=admin
+        f"/v1/admin/documents/{random_doc_id()}/acl", json={"groups": ["servicing"]}, headers=admin
     )
     assert r.status_code == 404 and r.json() == {"error": "not_found"}
 
@@ -225,10 +225,24 @@ def test_t17_admin_without_groups_sees_nothing(env) -> None:  # type: ignore[no-
     # Admin powers are management only.
     r = env.client.get("/v1/admin/documents?status=indexed", headers=env.headers("u_admin"))
     assert r.status_code == 200
-    rows = r.json()
+    rows = r.json()["items"]
     assert len(rows) == len(DOCS)
+    # Metadata only (BE-12): no page or chunk text.
     assert all(
-        set(row) == {"doc_id", "filename", "status", "failure_reason", "page_count"} for row in rows
+        set(row)
+        == {
+            "doc_id",
+            "filename",
+            "page_count",
+            "status",
+            "failure_reason",
+            "groups",
+            "users",
+            "uploaded_by",
+            "ingested_at",
+            "upload",
+        }
+        for row in rows
     )
 
 

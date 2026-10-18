@@ -168,3 +168,168 @@ bit-identical, which the "rebuild equals incremental" test requires.
   lock. Each query reads `version` and reloads if it changed.
 - Startup refuses to run if `index_state.embedding_model ≠ EMBEDDING_MODEL`, or if
   `version > 0` and the index file is missing (`rebuild-index` fixes both).
+
+## 5. Version 2 (extension.md): chat UI, admin uploads, large loan files
+
+`task.md` is unchanged; `extension.md` is the change document. New pieces:
+
+```
+browser ─► Caddy (https://localhost, single origin, CSP)
+             ├─ /            built React app (frontend/, Dockerfile target `web`)
+             ├─ /auth/*      Keycloak (KC_HTTP_RELATIVE_PATH=/auth), /auth/admin/* → 404
+             ├─ /v1/*        api (1 MB body limit)
+             └─ POST /v1/admin/uploads  api (55 MB body limit)
+api ──► Postgres ◄── worker (`python -m app.worker`, same image) ──► shared FAISS file in /data
+```
+
+| Area | Modules |
+|---|---|
+| Large files (§17) | `eval/synth/generate_corpus.py` (v2), `app/ingestion/context.py` (fields + prefix), `app/ingestion/progress.py`, pipeline steps `prepare_document` / `write_content` / `embed_into` |
+| Backend for the UI | `app/api/routes_me.py` (BE-1, BE-2), excerpts in `query_service.py` (BE-3), `SessionStartRecorder` (BE-4) |
+| Uploads | `app/uploads.py` (BE-8, BE-10, BE-11), `app/worker.py` (BE-9), `app/admin_ops.py` (BE-12, BE-13), migration `0005` |
+| Frontend | `frontend/src/*` per extension.md §7.1; tests in `frontend/tests/{unit,component,e2e}` |
+
+### Decisions not covered by extension.md
+
+**D30 Section headings in the v2 corpus.** Each section's first page starts with an all-caps
+title; table headers are sentence case ("Posting date"), so they are never mistaken for
+headings. The per-page `Loan … | Page X of Y` header repeats on every page and is removed by
+cleaning, as in real files. Version 1's workaround (D7, a loan number in every heading) is gone:
+the context prefix (§17.2) now solves the problem it addressed.
+
+**D31 Heading detection ignores table rows.** A line counts as a heading only if at least half
+of its non-space characters are letters, and a title-case line must contain no digits. Without
+this, a row such as `2023-04-01 $1,200.00 PAID` became the "section" of every later chunk.
+
+**D32 Readable section labels.** All-caps headings are stored in sentence case ("Bank
+statements", as in §17.2's example); words containing digits keep their case, so identifiers
+survive.
+
+**D33 Document fields come from raw text.** The loan number and borrower name are read from
+the first 5 pages *before* cleaning, so a loan number that only appears in the page header
+still counts. A borrower name ends at the first period ("Borrower name: John Stephens. Loan…").
+
+**D34 Prefix token budget.** Body size = 400 − (tokens of the document prefix + `" | Section: "`
++ 20 tokens for the section name). `token_count` stores the tokens of prefix + newline + text,
+the string that is embedded.
+
+**D35 Parallel preparation.** Extraction, OCR, cleaning and chunking run in a spawned process
+pool (`ingest --workers N`, default up to 6). Workers load only the tokenizer (same one the
+embedder uses), run single-threaded (Tesseract and HF tokenizers would otherwise oversubscribe
+the CPU ~10×), and return results in input order; embedding and DB writes stay in the main
+process. A test checks parallel output equals sequential output.
+
+**D36 `EMBEDDING_DEVICE`.** `cpu` by default (deterministic; tests and containers). Bulk
+ingestion on Apple silicon can use `mps`: 2.5× faster than CPU on this machine, vectors equal
+to CPU within 1.3e-7. Torch inside the Linux Docker VM on macOS embeds at only ~12 chunks/s, so
+the 75K-page corpus was ingested on the host and the index shared with the containers.
+
+**D37 Data outside synced folders.** `CORPUS_DIR` and `APP_DATA_DIR` let Compose mount the
+corpus and `/data` (index, document store) from a host folder. On macOS, iCloud-evicted files
+cannot be read through the Docker mount (EDEADLK), so they live in `~/loanrag-data`.
+
+**D38 Audit event shapes.** `audit_log.event` is `query`, `session_start`, `upload`,
+`acl_change` or `delete`. Query-only columns became nullable, with CHECK constraints: query rows
+must have every v1 field; `session_start` rows have no question hash and empty chunk arrays; admin
+rows also carry `doc_id`.
+
+**D39 Once per token.** `session_start` is deduplicated by `jti` (or a hash of the token when a
+token has no `jti`) in memory for 20 minutes, longer than the 15-minute token lifetime.
+
+**D40 Page endpoint additions.** It also returns `page_count` (for "Page 63 of 87" and "Go to
+page") and `section` (the page's first chunk's section, as §8.7 asks). Both are returned only
+after the access check.
+
+**D41 `X-Request-Id`.** Every `/v1` response carries the request ID (the same ID as the query's
+audit row), so error cards can hold it as a hidden attribute (UI-F12) while error bodies stay
+`{"error": …}`.
+
+**D42 SHA-256 unique among live documents only** (migration `0005`), so the content of a deleted
+file can be uploaded again (§6.1 rule 7 excludes soft-deleted documents). The CLI still treats a
+deleted match as indexed and skips it: CLI re-runs never resurrect a deleted document.
+
+**D43 The CLI does not touch uploads.** A document with an upload job belongs to the worker; the
+CLI skips it.
+
+**D44 Admin list shape.** `GET /v1/admin/documents` returns `{items, next_cursor, summary}`.
+Each item has the BE-12 fields plus `failure_reason` and `upload` (job status and pages done,
+for "Processing 40%"); `summary` has total / processing / failed counts for the summary chips.
+Still metadata only.
+
+**D45 ACL edits follow the upload rule.** `PUT …/acl` rejects an empty ACL and unknown groups
+or users with 422 `invalid_access`, like uploads (UI-F19's "same at-least-one rule"), and
+writes an `acl_change` audit event in the same transaction.
+
+**D46 Upload error codes.** 413 `file_too_large`; zero or several files → 422
+`validation_error`; 409 `duplicate` with `existing_filename` (the only error body with an
+extra field, as §6.1 specifies); retrying a job that has not failed → 409 `conflict`.
+
+**D47 Worker details.** The writer lock is held for the whole batch (spec step 2), with
+heartbeats while waiting for it. A document deleted while its job was queued is marked failed
+with no reason. A failed job's partial pages, chunks and vectors are removed; the stored PDF is
+kept for retry. `pages_done` follows extraction (every 5 pages), and embedding happens at
+"page N of N".
+
+**D48 No browser storage at all.** Even the theme choice is kept in memory (it resets to
+"system" on reload). ESLint bans `localStorage`, `sessionStorage`, `indexedDB`,
+`dangerouslySetInnerHTML` and `innerHTML` in app code.
+
+**D49 401 handling.** A 401 from `/v1/me` after a successful token refresh means "not
+provisioned or disabled": show the no-access screen (§5's flow). This avoids a sign-in loop that
+§10.2's generic rule would cause. Other 401s after one refresh-and-retry end the session:
+caches are cleared and `keycloak.login()` returns to `/dashboard?session=ended` (a flag, never a
+token), which shows the toast.
+
+**D50 Back-forward cache.** A page restored from bfcache is reloaded, so the back button after
+sign-out can never show the old conversation from memory (UI-T6).
+
+**D51 Contrast fixes (§9.2 "adjust values if needed").** Light coral #D9584A → #C24336 (error
+text on white was 3.9:1). New tokens: `marigold-line` (#B87C0B light) for chip outlines and the
+drop zone (marigold on white was 1.9:1, below 3:1 for UI components); `on-marigold` (dark ink,
+both themes) for chip text (light ink on dark-theme marigold failed); `on-coral`, `on-spruce`,
+`on-spruce-deep(-muted)` and `line`. `frontend/tests/unit/contrast.test.ts` checks every pair in
+both themes.
+
+**D52 Keycloak admin console.** Reachable only on the localhost-bound port
+(`KC_HOSTNAME_ADMIN=http://localhost:8080/auth`); Caddy returns 404 for `/auth/admin/*` (S15).
+
+**D53 Production web client origin.** The production realm reads `loanrag-web`'s exact
+redirect URI and web origin from `${LOANRAG_PUBLIC_ORIGIN}` at import time.
+
+**D54 Upload temp files** stream into `DOCUMENT_STORE_PATH/.incoming` (same filesystem, so the
+final move to `{doc_id}.pdf` is a rename) and are removed whatever the outcome.
+
+**D55 E2E fixtures.** The Playwright global setup builds unique fixture PDFs each run
+(`scripts/e2e_fixtures.py`, generator flags `--start-index` / `--no-config`), so reruns never
+collide as duplicates. It also picks a deep, underwriting-only question that the API really
+answers with the expected citation, so UI tests test the UI rather than retrieval quality.
+
+**D56 Silent-SSO page framing.** §11.2's CSP has `frame-ancestors 'none'`, but keycloak-js loads
+`/silent-check-sso.html` in a same-origin iframe for `check-sso` (the reason §11.2 includes
+`frame-src 'self'`). With `'none'` on that page the browser refuses to render it, and sign-in
+never initializes (found by the E2E suite: the Sign in button stayed disabled). Caddy therefore
+serves `/silent-check-sso.html` and its script with `frame-ancestors 'self'`. Every other app
+route keeps `frame-ancestors 'none'`.
+
+**D57 Admin console sign-in stays on 127.0.0.1:8080.** `KC_HOSTNAME=https://localhost/auth` applies
+to every realm, so the admin console (on `KC_HOSTNAME_ADMIN`, port 8080) sent its sign-in to the
+master realm at `https://localhost/auth/realms/master`, through Caddy. In a browser that does not
+trust Caddy's local certificate, opening http://localhost:8080 ended on a certificate error, and the
+master-realm sign-in page was reachable on the public origin (against S15). The one-shot
+`keycloak-init` Compose service sets the master realm's `frontendUrl` to
+`http://localhost:8080/auth` after every Keycloak start (`start-dev` keeps no database), and Caddy
+returns 404 for `/auth/realms/master/*` as well as `/auth/admin/*`. The `loanrag` realm keeps the
+issuer `https://localhost/auth/realms/loanrag`.
+
+**D58 Insufficient-answer wording mentions access (owner decision, 2026-10-17).** The owner asked
+for the "no answer" message to point users to their admin. Saying "you are not authorized" only
+when a hidden file matched would confirm that the file exists, breaking "hidden equals missing"
+(task.md §6.6, T9, UI-T3), so that option was declined. Instead, every insufficient answer
+(nothing visible matched, the model found no answer, citations failed twice) gets the same fixed
+text. The API answer is now "I couldn't find information to answer that in the files you have
+access to." (was task.md §9.2's "…in the documents available to you."). The card's hint is now
+"Try rephrasing, or include the loan number. If you think you should have access to this loan
+file, please check with your admin." This deliberately departs from UI-F11, which forbids access
+hints. Because the text is identical whether the loan is hidden, nonexistent or simply lacks the
+fact, it reveals nothing about any particular file. The cost is that users with no matching file
+are also pointed to their admin.

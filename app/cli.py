@@ -13,6 +13,7 @@ python -m app.cli eval [args passed to eval/run_eval.py]
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -61,10 +62,11 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     configure(backend)
     pipeline = IngestionPipeline(
         _engine(),
-        Embedder(s.embedding_model),
+        Embedder(s.embedding_model, device=s.embedding_device),
         index_path=Path(s.faiss_index_path),
         document_store=Path(s.document_store_path),
         acl_backend=backend,
+        workers=args.workers,
     )
     try:
         summary = pipeline.run(Path(args.source))
@@ -88,14 +90,34 @@ def cmd_rebuild_index(args: argparse.Namespace) -> int:
     from app.retrieval.index_manager import WriterLockHeld
 
     s = get_settings()
+    if args.no_context_prefix and not args.index_path:
+        print(
+            "--no-context-prefix needs --index-path (a separate, evaluation-only index)",
+            file=sys.stderr,
+        )
+        return 1
+    if args.index_path and not args.no_context_prefix:
+        print(
+            "--index-path is only for --no-context-prefix; the live index uses FAISS_INDEX_PATH",
+            file=sys.stderr,
+        )
+        return 1
     try:
         count, version = rebuild_index(
-            _engine(), Embedder(s.embedding_model), Path(s.faiss_index_path)
+            _engine(),
+            Embedder(s.embedding_model, device=s.embedding_device),
+            Path(args.index_path or s.faiss_index_path),
+            use_prefix=not args.no_context_prefix,
         )
     except WriterLockHeld:
         print("The index writer lock is held; try again later.", file=sys.stderr)
         return 2
-    print(f"rebuilt index: {count} vectors, version {version}")
+    if version is None:
+        print(
+            f"wrote evaluation index without context prefix: {count} vectors -> {args.index_path}"
+        )
+    else:
+        print(f"rebuilt index: {count} vectors, version {version}")
     return 0
 
 
@@ -152,7 +174,21 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("ingest", help="ingest PDFs into Postgres and FAISS")
     p.add_argument("--source", required=True)
     p.add_argument("--acl-config", required=True)
-    sub.add_parser("rebuild-index", help="regenerate FAISS from the chunks table")
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=max(1, min(6, (os.cpu_count() or 2) - 2)),
+        help="processes for extraction/OCR/chunking (embedding stays in-process)",
+    )
+    p = sub.add_parser("rebuild-index", help="regenerate FAISS from the chunks table")
+    p.add_argument(
+        "--no-context-prefix",
+        action="store_true",
+        help="embed raw chunk text only (evaluation comparison, extension.md §17.5)",
+    )
+    p.add_argument(
+        "--index-path", default=None, help="output path for the --no-context-prefix index"
+    )
     p = sub.add_parser("gen-test-keys", help="create a local RSA key pair for test tokens")
     p.add_argument("--out", default="keys")
     p = sub.add_parser("mint-token", help="sign a test JWT with the local private key")

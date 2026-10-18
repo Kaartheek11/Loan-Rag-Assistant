@@ -156,6 +156,55 @@ def ranking_metrics(ranked: list[int], gold: set[int]) -> tuple[float, float, fl
     return r5, r10, rr
 
 
+_NP_IDENT_SQL = text(
+    """
+    SELECT c.chunk_id FROM chunks c
+    WHERE c.deleted_at IS NULL AND (
+        c.identifiers && CAST(:other AS text[])
+        OR (c.identifiers && CAST(:loans AS text[]) AND EXISTS (
+            SELECT 1 FROM unnest(CAST(:loans AS text[])) l WHERE strpos(upper(c.text), l) > 0))
+    )
+    ORDER BY ts_rank_cd(to_tsvector('simple', c.text), websearch_to_tsquery('simple', :q)) DESC,
+             c.chunk_id
+    LIMIT :n
+    """
+)
+_NP_FTS_SQL = text(
+    """
+    SELECT c.chunk_id FROM chunks c, websearch_to_tsquery('simple', :q) AS query
+    WHERE c.deleted_at IS NULL AND to_tsvector('simple', c.text) @@ query
+    ORDER BY ts_rank_cd(to_tsvector('simple', c.text), query) DESC, c.chunk_id
+    LIMIT :n
+    """
+)
+
+
+def keyword_search_no_prefix(conn: Any, question: str, n: int) -> list[int]:
+    """Keyword search as if chunks had no context prefix (extension.md §17.5 comparison):
+    full text over the raw chunk text only, and a loan number matches only where it appears
+    in the chunk's own text (the prefix is what adds it to every chunk's identifiers)."""
+    from app.retrieval.identifiers import LOAN_NUMBER, extract_identifiers
+    from app.retrieval.keyword_search import fulltext_query
+
+    q = fulltext_query(question)
+    idents = extract_identifiers(question)
+    loans = [i for i in idents if LOAN_NUMBER.fullmatch(i)]
+    other = [i for i in idents if i not in loans]
+    ranked: list[int] = []
+    if idents:
+        ranked += [
+            int(r[0])
+            for r in conn.execute(_NP_IDENT_SQL, {"other": other, "loans": loans, "q": q, "n": n})
+        ]
+    if q and len(ranked) < n:
+        seen = set(ranked)
+        for r in conn.execute(_NP_FTS_SQL, {"q": q, "n": n}):
+            if int(r[0]) not in seen:
+                ranked.append(int(r[0]))
+                seen.add(int(r[0]))
+    return ranked[:n]
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         prog="eval", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -168,6 +217,18 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--top-k", type=int, default=6)
     p.add_argument("--latency-sample", type=int, default=100)
     p.add_argument("--retrieval-only", action="store_true")
+    p.add_argument(
+        "--no-prefix-index",
+        type=Path,
+        default=None,
+        help="index built with `rebuild-index --no-context-prefix` (§17.5)",
+    )
+    p.add_argument(
+        "--latency-runs",
+        type=int,
+        default=100,
+        help="retrievals timed for the narrowest-access users (§17.6)",
+    )
     p.add_argument("--out", type=Path, default=Path("eval/results"))
     args = p.parse_args(argv)
 
@@ -175,7 +236,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.provider:
         settings = settings.model_copy(update={"llm_provider": args.provider})
     engine = make_engine(settings.database_url, environment=settings.environment)
-    embedder = Embedder(settings.embedding_model)
+    embedder = Embedder(settings.embedding_model, device=settings.embedding_device)
     with engine.connect() as conn:
         state = read_index_state(conn)
     if state is None:
@@ -195,6 +256,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     oracle = Oracle(args.acl, args.users)
     chunks = load_chunks(engine)
+    # The leak oracle knows only the seed ACLs, so documents added later (admin uploads,
+    # including the E2E fixtures) would be reported as leaks, or skew the metrics. Refuse.
+    extra = sorted({c["filename"] for c in chunks.values()} - set(oracle.docs))
+    if extra:
+        raise SystemExit(
+            f"{len(extra)} live document(s) are not in the seed corpus (e.g. {extra[0]}): "
+            "delete uploaded documents (admin Files page or DELETE /v1/admin/documents/{id}) "
+            "before running the evaluation"
+        )
     by_page: dict[tuple[str, int], list[int]] = {}
     for cid, c in chunks.items():
         by_page.setdefault((c["filename"], c["page"]), []).append(cid)
@@ -211,11 +281,23 @@ def main(argv: list[str] | None = None) -> int:
             identities[uid] = identity
 
     # ---- Retrieval-only comparison (no LLM) -------------------------------------------
-    retrieval: dict[str, list[tuple[float, float, float]]] = {
-        "vector": [],
-        "keyword": [],
-        "hybrid": [],
+    from app.retrieval.retriever import Retriever
+
+    retrievers: dict[str, Retriever] = {"with_prefix": service.retriever}
+    if args.no_prefix_index:
+        np_holder = IndexHolder(args.no_prefix_index, embedder.dim)
+        np_holder.load(state[0])
+        retrievers["without_prefix"] = Retriever(
+            np_holder,
+            n_start=settings.retrieval_n_start,
+            n_max=settings.retrieval_n_max,
+            keyword_fn=keyword_search_no_prefix,
+        )
+    modes: tuple[Mode, ...] = ("vector", "keyword", "hybrid")
+    metrics: dict[str, dict[str, list[tuple[float, float, float]]]] = {
+        v: {m: [] for m in modes} for v in retrievers
     }
+    groups_of: list[tuple[str, bool]] = []  # (depth, context_dependent) per answerable question
     gold_missing = 0
     per_question: list[dict[str, Any]] = []
     for q in questions:
@@ -224,20 +306,22 @@ def main(argv: list[str] | None = None) -> int:
         gold = gold_chunk_ids(q["gold"], by_page, chunks)
         if not gold:
             gold_missing += 1
+        groups_of.append((q.get("depth", "-"), bool(q.get("context_dependent"))))
         qvec = embedder.embed_query(q["question"])
-        modes: tuple[Mode, ...] = ("vector", "keyword", "hybrid")
-        for mode in modes:
-            with engine.connect() as conn:
-                res = service.retriever.retrieve(
-                    conn,
-                    identities[q["user"]],
-                    q["question"],
-                    qvec,
-                    10,
-                    str(uuid.uuid4()),
-                    mode=mode,
-                )
-            retrieval[mode].append(ranking_metrics(res.permitted.ids(), gold))
+        for variant, retriever in retrievers.items():
+            for mode in modes:
+                with engine.connect() as conn:
+                    res = retriever.retrieve(
+                        conn,
+                        identities[q["user"]],
+                        q["question"],
+                        qvec,
+                        10,
+                        str(uuid.uuid4()),
+                        mode=mode,
+                    )
+                metrics[variant][mode].append(ranking_metrics(res.permitted.ids(), gold))
+    retrieval = metrics["with_prefix"]
 
     def agg(rows: list[tuple[float, float, float]]) -> dict[str, float]:
         n = len(rows) or 1
@@ -266,6 +350,64 @@ def main(argv: list[str] | None = None) -> int:
         "gold_not_locatable": gold_missing,
         "retrieval": {mode: agg(rows) for mode, rows in retrieval.items()},
     }
+    if "without_prefix" in metrics:
+        report["retrieval_without_prefix"] = {
+            mode: agg(rows) for mode, rows in metrics["without_prefix"].items()
+        }
+
+    def recall10(rows: list[tuple[float, float, float]], keep: list[bool]) -> dict[str, float]:
+        picked = [r[1] for r, k in zip(rows, keep, strict=True) if k]
+        return {"recall@10": sum(picked) / (len(picked) or 1), "n": len(picked)}
+
+    depths = sorted({d for d, _ in groups_of})
+    report["recall_at_10_breakdown"] = {
+        variant: {
+            mode: {
+                **{f"depth {d}": recall10(rows, [g[0] == d for g in groups_of]) for d in depths},
+                "context_dependent": recall10(rows, [g[1] for g in groups_of]),
+            }
+            for mode, rows in by_mode.items()
+        }
+        for variant, by_mode in metrics.items()
+    }
+
+    # §17.6: p50/p95 retrieval latency for the users with the narrowest access.
+    from app.security import permissions as perm
+
+    with engine.connect() as conn:
+        counts = {
+            uid: perm.count_readable_documents(conn, ident)
+            for uid, ident in identities.items()
+            if ident is not None
+        }
+    narrow_some = min((u for u, c in counts.items() if c > 0), key=lambda u: counts[u])
+    narrow_none = next((u for u, c in counts.items() if c == 0), None)
+    latency: dict[str, Any] = {}
+    sample = [q["question"] for q in questions if q["kind"] == "answerable"][: args.latency_runs]
+    for label, uid in (("narrowest_with_access", narrow_some), ("no_access", narrow_none)):
+        if uid is None:
+            continue
+        times: list[float] = []
+        rounds: list[int] = []
+        for question in sample:
+            t0 = time.perf_counter()
+            qv = embedder.embed_query(question)
+            with engine.connect() as conn:
+                res = service.retriever.retrieve(
+                    conn, identities[uid], question, qv, args.top_k, str(uuid.uuid4())
+                )
+            times.append((time.perf_counter() - t0) * 1000)
+            rounds.append(res.rounds)
+        latency[label] = {
+            "user": uid,
+            "readable_documents": counts[uid],
+            "n": len(times),
+            "p50_ms": round(percentile(times, 0.5), 1),
+            "p95_ms": round(percentile(times, 0.95), 1),
+            "max_rounds": max(rounds),
+            "mean_rounds": round(statistics.fmean(rounds), 2),
+        }
+    report["retrieval_latency_narrowest"] = latency
 
     if not args.retrieval_only:
         # Throttle only the hosted free tier (§8.7); latency is measured after the wait.
@@ -279,6 +421,7 @@ def main(argv: list[str] | None = None) -> int:
         refused = unanswerable_n = 0
         probe_ok = probe_n = 0
         leaks: list[dict[str, Any]] = []
+        request_ids: list[str] = []
         last = 0.0
         for q in questions:
             if interval:
@@ -289,6 +432,7 @@ def main(argv: list[str] | None = None) -> int:
             t0 = time.perf_counter()
             out = service.answer(identities[q["user"]], q["question"], args.top_k)
             elapsed = (time.perf_counter() - t0) * 1000
+            request_ids.append(out.request_id)
             if len(latencies) < args.latency_sample:
                 latencies.append(elapsed)
             returned = set(out.returned_chunk_ids)
@@ -329,11 +473,15 @@ def main(argv: list[str] | None = None) -> int:
                     "answer": out.answer,
                 }
             )
-        # Audit rows for this run: hidden chunks must not appear there either.
+        # Audit rows for this run's requests (not other traffic on a live stack): hidden
+        # chunks must not appear there either.
         with engine.connect() as conn:
             rows = conn.execute(
-                text("SELECT user_id, returned_chunk_ids FROM audit_log WHERE ts >= :t"),
-                {"t": report["timestamp"]},
+                text(
+                    "SELECT user_id, returned_chunk_ids FROM audit_log "
+                    "WHERE request_id = ANY(CAST(:ids AS uuid[]))"
+                ),
+                {"ids": request_ids},
             ).all()
         for row in rows:
             for cid in row.returned_chunk_ids:

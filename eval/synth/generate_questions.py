@@ -1,14 +1,17 @@
-"""Build the labeled evaluation set from facts.jsonl (spec §11.2).
+"""Build the labeled evaluation set from facts.jsonl (task.md §11.2, extension.md §17.5).
 
 Gold answers are labeled by document + page + planted fact text, never by chunk ID.
+Answerable questions are split by the depth of the gold page: about a third on pages 1-10,
+a third on pages 11-50, and a third on page 51 or later. Questions whose answer page names
+neither the loan number nor the borrower are marked `context_dependent` (at least 30).
 
 Output rows (eval/questions.jsonl):
-  {"id", "kind": answerable|unanswerable|probe, "user", "question", "answerable",
-   "answer", "gold": [{"doc", "page", "fact"}]}
+  {"id", "kind": answerable|unanswerable|probe, "user", "question", "answerable", "answer",
+   "fact_type", "depth", "context_dependent", "gold": [{"doc", "page", "section", "fact"}]}
 
 Usage:
   uv run python -m eval.synth.generate_questions --seed 7 \
-      --answerable 160 --unanswerable 25 --probes 35
+      --answerable 162 --unanswerable 25 --probes 35
 """
 
 from __future__ import annotations
@@ -21,37 +24,45 @@ from pathlib import Path
 import yaml
 
 TEMPLATES: dict[str, list[str]] = {
-    "escrow_item": [
-        "What is the annual escrow disbursement for {hint} on loan {ln}?",
-        "How much does the escrow account pay each year for {hint} under loan {ln}?",
+    "credit_inquiry": ["Which creditor made the credit inquiry dated {hint} on loan {ln}?"],
+    "paystub_ytd": [
+        "What year-to-date gross earnings does the pay stub for the period ending {hint} show "
+        "for loan {ln}?"
     ],
-    "condition": [
-        "Before funding loan {ln}, which organization must provide the document {hint}?",
-        "Who must issue the paperwork {hint} as a condition of approval for loan {ln}?",
+    "schedule_c_profit": ["What net profit does Schedule C report from {hint} for loan {ln}?"],
+    "bank_ending_balance": [
+        "What was the ending balance on the {h0} statement for account ending {h1} on loan {ln}?"
     ],
-    "reserves": [
-        "How much in post-closing reserves did the underwriter document for loan {ln}?",
-        "What reserve amount was listed as a compensating factor on loan {ln}?",
+    "large_deposit": [
+        "How much was the deposit on {h0} that was sourced to the sale of a {h1} for loan {ln}?"
     ],
-    "rate_lock": [
-        "When does the interest rate lock expire for loan {ln}?",
-        "What is the rate lock expiration date on loan {ln}?",
+    "voe_hire_date": [
+        "What original hire date did the employer confirm for the borrower on loan {ln}?"
     ],
+    "earnest_money": ["How much earnest money did the buyer deposit for loan {ln}?"],
+    "appraisal_adjustment": ["What adjustment did the appraiser apply for {hint} on loan {ln}?"],
     "hoa_dues": [
         "What are the monthly HOA dues for loan {ln}?",
         "How much are the homeowners association dues each month on loan {ln}?",
     ],
-    "prepayment_penalty": [
-        "What prepayment penalty percentage applies to loan {ln}?",
-        "What percent of the balance is charged as a prepayment penalty on loan {ln}?",
+    "title_exception": [
+        "In whose favor is the unrecorded {hint} listed in the title exceptions for loan {ln}?"
     ],
-    "interest_rate": ["What is the interest rate on loan {ln}?"],
-    "principal": ["What is the original principal amount of loan {ln}?"],
-    "term": ["What is the term of loan {ln}?"],
+    "insurance_premium": ["What is the annual hazard insurance premium for loan {ln}?"],
+    "reserves": [
+        "How much in post-closing reserves did the underwriter document for loan {ln}?",
+        "What reserve amount was listed as a compensating factor on loan {ln}?",
+    ],
+    "condition": ["Before funding loan {ln}, which organization must provide the document {hint}?"],
+    "escrow_item": ["What is the annual escrow disbursement for {hint} on loan {ln}?"],
+    "rate_lock": ["When does the interest rate lock expire for loan {ln}?"],
+    "prepayment_penalty": ["What prepayment penalty percentage applies to loan {ln}?"],
+    "loe_withdrawal": [
+        "How much was the withdrawal explained in the borrower's letter dated {hint} for loan {ln}?"
+    ],
+    "late_fee": ["What late fee was charged for the payment due {hint} on loan {ln}?"],
 }
-# Planted facts are the main signal; base facts (rate/principal/term) are a minority.
-PLANTED = ["escrow_item", "condition", "reserves", "rate_lock", "hoa_dues", "prepayment_penalty"]
-BASE = ["interest_rate", "principal", "term"]
+DEPTHS = [("1-10", 1, 10), ("11-50", 11, 50), ("51+", 51, 10_000)]
 
 UNANSWERABLE_TEMPLATES = [
     "What is the annual llama grazing fee in the escrow account for loan {ln}?",
@@ -69,11 +80,22 @@ MISSING_LOAN_TEMPLATES = [
 ]
 
 
+def depth_of(page: int) -> str:
+    return next(name for name, lo, hi in DEPTHS if lo <= page <= hi)
+
+
 def _visible(user: dict[str, object], acl: dict[str, list[str]]) -> bool:
-    groups = set(user.get("groups") or [])  # type: ignore[arg-type]
+    groups = set(user.get("groups") or [])  # type: ignore[call-overload]
     return bool(groups & set(acl.get("groups") or [])) or user["user_id"] in (
         acl.get("users") or []
     )
+
+
+def question_for(fact: dict[str, object], rng: random.Random) -> str:
+    template = rng.choice(TEMPLATES[str(fact["fact_type"])])
+    hint = str(fact.get("question_hint", ""))
+    h0, _, h1 = hint.partition("|")
+    return template.format(ln=fact["loan_number"], hint=hint, h0=h0, h1=h1)
 
 
 def build(
@@ -86,70 +108,64 @@ def build(
     n_answerable: int,
     n_unanswerable: int,
     n_probes: int,
+    min_context_dependent: int = 30,
 ) -> list[dict[str, object]]:
     rng = random.Random(seed)
-    facts = [json.loads(line) for line in facts_path.open()]
+    facts = [
+        f for f in (json.loads(line) for line in facts_path.open()) if f["fact_type"] in TEMPLATES
+    ]
     manifest = {r["filename"]: r for r in (json.loads(line) for line in manifest_path.open())}
     acls = yaml.safe_load(acl_path.read_text())["documents"]
-    users = [u for u in yaml.safe_load(users_path.read_text())["users"]]
+    users = list(yaml.safe_load(users_path.read_text())["users"])
     readers = {f: [u for u in users if _visible(u, a)] for f, a in acls.items()}
     outsiders = {f: [u for u in users if not _visible(u, a)] for f, a in acls.items()}
-
-    by_type: dict[str, list[dict[str, object]]] = {}
-    for f in facts:
-        by_type.setdefault(f["fact_type"], []).append(f)
-    for lst in by_type.values():
-        rng.shuffle(lst)
-
-    rows: list[dict[str, object]] = []
+    rng.shuffle(facts)
     used_docs: set[str] = set()
 
-    def take(ftype: str, need_readers: bool) -> dict[str, object] | None:
-        pool = by_type.get(ftype, [])
-        while pool:
-            f = pool.pop()
+    def gold(f: dict[str, object]) -> list[dict[str, object]]:
+        return [
+            {
+                "doc": f["doc_filename"],
+                "page": f["page"],
+                "section": f["section"],
+                "fact": f["fact_text"],
+            }
+        ]
+
+    rows: list[dict[str, object]] = []
+    per_depth, extra = divmod(n_answerable, len(DEPTHS))
+    for k, (name, lo, hi) in enumerate(DEPTHS):
+        want = per_depth + (1 if k < extra else 0)
+        taken = 0
+        for f in facts:
+            if taken >= want:
+                break
             doc = str(f["doc_filename"])
-            if doc in used_docs:
-                continue
-            if need_readers and not readers.get(doc):
-                continue
-            if not need_readers and not outsiders.get(doc):
+            if doc in used_docs or not readers.get(doc) or not lo <= int(f["page"]) <= hi:
                 continue
             used_docs.add(doc)
-            return f
-        return None
+            user = rng.choice(readers[doc])
+            rows.append(
+                {
+                    "kind": "answerable",
+                    "user": user["user_id"],
+                    "question": question_for(f, rng),
+                    "answerable": True,
+                    "answer": f["answer"],
+                    "fact_type": f["fact_type"],
+                    "depth": name,
+                    "context_dependent": bool(f["context_dependent"]),
+                    "page_count": manifest[doc]["page_count"],
+                    "gold": gold(f),
+                }
+            )
+            taken += 1
+        if taken < want:
+            raise SystemExit(f"not enough facts at depth {name}: {taken}/{want}")
+    n_ctx = sum(bool(r["context_dependent"]) for r in rows)
+    if n_ctx < min_context_dependent:
+        raise SystemExit(f"only {n_ctx} context-dependent questions (< {min_context_dependent})")
 
-    def question_for(f: dict[str, object]) -> str:
-        template = rng.choice(TEMPLATES[str(f["fact_type"])])
-        return template.format(ln=f["loan_number"], hint=f.get("question_hint", ""))
-
-    def gold(f: dict[str, object]) -> list[dict[str, object]]:
-        return [{"doc": f["doc_filename"], "page": f["page"], "fact": f["fact_text"]}]
-
-    # Answerable: ~80% planted facts, ~20% base facts, asked by a user who can read the doc.
-    n_base = n_answerable // 5
-    plan = [PLANTED[i % len(PLANTED)] for i in range(n_answerable - n_base)]
-    plan += [BASE[i % len(BASE)] for i in range(n_base)]
-    for ftype in plan:
-        f = take(ftype, need_readers=True)
-        if f is None:
-            continue
-        user = rng.choice(readers[str(f["doc_filename"])])
-        rows.append(
-            {
-                "kind": "answerable",
-                "user": user["user_id"],
-                "question": question_for(f),
-                "answerable": True,
-                "answer": f["answer"],
-                "fact_type": f["fact_type"],
-                "scanned": manifest[str(f["doc_filename"])]["scanned"],
-                "gold": gold(f),
-            }
-        )
-
-    # Unanswerable: facts that exist in no document, asked by a reader of a real loan,
-    # plus questions about loan numbers that do not exist.
     docs = [d for d in manifest if readers.get(d)]
     for i in range(n_unanswerable):
         if i % 4 == 3:
@@ -173,27 +189,31 @@ def build(
             }
         )
 
-    # Permission probes: the gold document exists but is hidden from the asking user.
-    for i in range(n_probes):
-        f = take(PLANTED[i % len(PLANTED)], need_readers=False)
-        if f is None:
+    probes = 0
+    for f in facts:
+        if probes >= n_probes:
+            break
+        doc = str(f["doc_filename"])
+        if doc in used_docs or not outsiders.get(doc):
             continue
-        user = rng.choice(outsiders[str(f["doc_filename"])])
+        used_docs.add(doc)
+        user = rng.choice(outsiders[doc])
         rows.append(
             {
                 "kind": "probe",
                 "user": user["user_id"],
-                "question": question_for(f),
+                "question": question_for(f, rng),
                 "answerable": False,
                 "answer": f["answer"],
                 "fact_type": f["fact_type"],
+                "depth": depth_of(int(f["page"])),
+                "context_dependent": bool(f["context_dependent"]),
                 "gold": gold(f),
             }
         )
+        probes += 1
 
-    for i, row in enumerate(rows, start=1):
-        row["id"] = f"q{i:03d}"
-    return [{"id": r.pop("id"), **r} for r in rows]
+    return [{"id": f"q{i:03d}", **r} for i, r in enumerate(rows, start=1)]
 
 
 def main() -> None:
@@ -204,7 +224,7 @@ def main() -> None:
     p.add_argument("--synth-dir", type=Path, default=Path("eval/synth"))
     p.add_argument("--config-dir", type=Path, default=Path("config"))
     p.add_argument("--out", type=Path, default=Path("eval/questions.jsonl"))
-    p.add_argument("--answerable", type=int, default=160)
+    p.add_argument("--answerable", type=int, default=162)
     p.add_argument("--unanswerable", type=int, default=25)
     p.add_argument("--probes", type=int, default=35)
     args = p.parse_args()
@@ -221,10 +241,15 @@ def main() -> None:
     with args.out.open("w") as f:
         for row in rows:
             f.write(json.dumps(row) + "\n")
-    kinds: dict[str, int] = {}
+    summary: dict[str, int] = {}
     for r in rows:
-        kinds[str(r["kind"])] = kinds.get(str(r["kind"]), 0) + 1
-    print(json.dumps({"total": len(rows), **kinds}))
+        summary[str(r["kind"])] = summary.get(str(r["kind"]), 0) + 1
+        if r["kind"] == "answerable":
+            summary[f"depth {r['depth']}"] = summary.get(f"depth {r['depth']}", 0) + 1
+            summary["context_dependent"] = summary.get("context_dependent", 0) + int(
+                bool(r["context_dependent"])
+            )
+    print(json.dumps({"total": len(rows), **summary}))
 
 
 if __name__ == "__main__":

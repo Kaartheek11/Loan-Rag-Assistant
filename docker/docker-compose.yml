@@ -29,9 +29,14 @@ services:
     environment:
       KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN:-admin}
       KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?set KEYCLOAK_ADMIN_PASSWORD}
-      # Fixed public URL so the token `iss` is the same no matter which host name
-      # the client used; the API fetches JWKS over the internal network.
-      KC_HOSTNAME: http://localhost:8080
+      # Served under /auth behind Caddy (extension.md BE-6). The fixed hostname makes the
+      # token issuer https://localhost/auth/realms/loanrag whether Keycloak is reached from
+      # the browser or the API container; the API fetches JWKS over the internal network.
+      KC_HTTP_RELATIVE_PATH: /auth
+      KC_HOSTNAME: https://localhost/auth
+      KC_PROXY_HEADERS: xforwarded
+      # Admin console only on the localhost-bound port, never through Caddy (S15).
+      KC_HOSTNAME_ADMIN: http://localhost:8080/auth
       KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
       KC_HTTP_ENABLED: "true"
       KC_HEALTH_ENABLED: "true"
@@ -42,6 +47,29 @@ services:
       # Bound to localhost only; the admin console is never routed through Caddy (S15).
       - "127.0.0.1:8080:8080"
 
+  # One-shot: keep the master realm (admin console sign-in) on the localhost-bound port.
+  # KC_HOSTNAME points every realm at https://localhost/auth, so without a master-realm
+  # frontendUrl the console would send its login through Caddy (S15). start-dev keeps no
+  # database, so this runs after every Keycloak (re)create.
+  keycloak-init:
+    image: quay.io/keycloak/keycloak:26.0.7
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until /opt/keycloak/bin/kcadm.sh config credentials --config /tmp/kcadm.config \
+            --server http://keycloak:8080/auth --realm master \
+            --user "$$KC_USER" --password "$$KC_PASSWORD" >/dev/null 2>&1; do sleep 3; done
+        /opt/keycloak/bin/kcadm.sh update realms/master --config /tmp/kcadm.config \
+          -s attributes.frontendUrl=http://localhost:8080/auth
+        echo "master realm frontendUrl set"
+    environment:
+      KC_USER: ${KEYCLOAK_ADMIN:-admin}
+      KC_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?set KEYCLOAK_ADMIN_PASSWORD}
+    depends_on:
+      keycloak:
+        condition: service_started
+    restart: "no"
+
   ollama:
     image: ollama/ollama:0.5.7
     volumes:
@@ -49,22 +77,27 @@ services:
     ports:
       - "127.0.0.1:11434:11434"
 
-  api:
+  api: &app
     build:
       context: ..
       dockerfile: docker/Dockerfile
+      target: api
     env_file: ../.env
     environment:
       DATABASE_URL: postgresql+psycopg://${APP_DB_ROLE:-loanrag_app}:${APP_DB_PASSWORD}@postgres:5432/loanrag
       MIGRATION_DATABASE_URL: postgresql+psycopg://loanrag_owner:${POSTGRES_OWNER_PASSWORD}@postgres:5432/loanrag
-      JWKS_URL: http://keycloak:8080/realms/loanrag/protocol/openid-connect/certs
-      JWT_ISSUER: http://localhost:8080/realms/loanrag
+      JWKS_URL: http://keycloak:8080/auth/realms/loanrag/protocol/openid-connect/certs
+      JWT_ISSUER: https://localhost/auth/realms/loanrag
       OLLAMA_BASE_URL: http://ollama:11434
       FAISS_INDEX_PATH: /data/index.faiss
       DOCUMENT_STORE_PATH: /data/documents
     volumes:
-      - appdata:/data
-      - ../corpus:/corpus:ro
+      # Index + document store. Defaults to a named volume; on macOS point APP_DATA_DIR at a
+      # host folder outside iCloud so host-side CLI runs and the API share one index.
+      - ${APP_DATA_DIR:-appdata}:/data
+      # Keep the corpus outside iCloud/Dropbox-synced folders: evicted files can't be read
+      # through the Docker mount (macOS EDEADLK). Defaults to ./corpus.
+      - ${CORPUS_DIR:-../corpus}:/corpus:ro
       - ../config:/app/config:ro
     depends_on:
       postgres:
@@ -72,16 +105,30 @@ services:
       keycloak:
         condition: service_started
 
+  # Upload worker (extension.md BE-9): same image and settings, different command.
+  worker:
+    <<: *app
+    command: ["python", "-m", "app.worker"]
+    healthcheck:
+      disable: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   caddy:
-    image: caddy:2.8.4
+    # Caddy image with the built frontend baked in (Dockerfile target `web`).
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: web
     ports:
       - "443:443"
       - "80:80"
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
     depends_on:
       - api
+      - keycloak
 
 volumes:
   pgdata:

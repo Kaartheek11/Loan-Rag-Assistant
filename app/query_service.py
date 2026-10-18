@@ -26,9 +26,10 @@ from app.security.permissions import PermittedSet
 
 log = structlog.get_logger(__name__)
 
-INSUFFICIENT_ANSWER = (
-    "I couldn't find information to answer that in the documents available to you."
-)
+# One fixed wording for every insufficient case (nothing visible matched, the model found no
+# answer, or citations failed twice), so it never reveals whether a hidden file matched (§6.6).
+# Wording changed from task.md §9.2 at the owner's request (architecture D58).
+INSUFFICIENT_ANSWER = "I couldn't find information to answer that in the files you have access to."
 
 
 class ServiceUnavailable(RuntimeError):
@@ -84,9 +85,10 @@ class QueryService:
         *,
         retrieval_k: int | None = None,
         mode: Mode = "hybrid",
+        request_id: str | None = None,
     ) -> QueryOutcome:
         started = time.perf_counter()
-        request_id = str(uuid.uuid4())
+        request_id = request_id or str(uuid.uuid4())
         outcome = QueryOutcome(request_id, "insufficient", INSUFFICIENT_ANSWER)
         status_for_audit = "error"
         try:
@@ -159,6 +161,8 @@ class QueryService:
                         "doc_id": c.chunk.doc_id,
                         "filename": c.chunk.filename,
                         "page": c.chunk.page,
+                        # Raw chunk text, never the context prefix (BE-3, §17.2).
+                        "excerpt": c.chunk.text,
                     }
                     for c in citations
                 ]

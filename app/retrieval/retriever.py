@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -28,10 +29,19 @@ class RetrievalResult:
 
 
 class Retriever:
-    def __init__(self, index: IndexHolder, *, n_start: int, n_max: int) -> None:
+    def __init__(
+        self,
+        index: IndexHolder,
+        *,
+        n_start: int,
+        n_max: int,
+        keyword_fn: Callable[[Connection, str, int], list[int]] = keyword_search,
+    ) -> None:
         self.index = index
         self.n_start = n_start
         self.n_max = n_max
+        # Injectable so the evaluation can compare variants (extension.md §17.5).
+        self.keyword_fn = keyword_fn
 
     def retrieve(
         self,
@@ -48,7 +58,7 @@ class Retriever:
         while True:
             rounds += 1
             vec = self.index.search(query_vector, n) if mode != "keyword" else []
-            kw = keyword_search(conn, question, n) if mode != "vector" else []
+            kw = self.keyword_fn(conn, question, n) if mode != "vector" else []
             # E1: only the visible subset survives; order within each list is preserved,
             # so ranks are recomputed on visible-only lists.
             visible = permissions.visible_ids(conn, identity, set(vec) | set(kw))

@@ -97,8 +97,8 @@ def test_section_heading_detection(count) -> None:  # type: ignore[no-untyped-de
         "Conditions of Approval:\nThe title must be updated.",
     ]
     chunks = chunk_pages(pages, count)
-    assert chunks[0].section == "ESCROW ANALYSIS - LOAN LN-2024-000001"
-    assert chunks[1].section == "ESCROW ANALYSIS - LOAN LN-2024-000001"  # carried over
+    assert chunks[0].section == "Escrow analysis - loan LN-2024-000001"
+    assert chunks[1].section == "Escrow analysis - loan LN-2024-000001"  # carried over
     assert chunks[2].section == "Conditions of Approval"
     assert is_heading("Underwriting Notes")
     assert not is_heading("The borrower provided an updated bank statement for review.")

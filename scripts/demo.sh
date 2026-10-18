@@ -13,7 +13,7 @@ QUESTION="${QUESTION:-What percent of the balance is charged as a prepayment pen
 token() {
   local user="$1"
   if [[ "${AUTH:-mint}" == "keycloak" ]]; then
-    curl -s http://localhost:8080/realms/loanrag/protocol/openid-connect/token \
+    curl -s http://localhost:8080/auth/realms/loanrag/protocol/openid-connect/token \
       -d grant_type=password -d client_id=loanrag-api -d "username=${user#u_}" \
       --data-urlencode "password=${DEV_USER_PASSWORD:?set DEV_USER_PASSWORD}" |
       python3 -c 'import sys, json; print(json.load(sys.stdin)["access_token"])'

@@ -7,9 +7,9 @@ from pathlib import Path
 from typing import Any
 
 import structlog
-from sqlalchemy import Engine, select, text
+from sqlalchemy import Engine, text
 
-from app.db.tables import documents
+from app.audit.audit_log import write_admin_event
 from app.retrieval.index_manager import FaissIndex, bump_version, writer_lock
 from app.security import permissions
 from app.security.permissions import Acl
@@ -25,13 +25,21 @@ def _uuid(doc_id: str) -> uuid.UUID | None:
         return None
 
 
-def update_acl(engine: Engine, doc_id: str, acl: Acl) -> bool:
-    """Replace the ACL on the document and all of its chunks in ONE transaction (F16, T4)."""
+def update_acl(engine: Engine, doc_id: str, acl: Acl, admin_user_id: str) -> bool:
+    """Replace the ACL on the document and all of its chunks in ONE transaction (F16, T4),
+    with the `acl_change` audit event (BE-13) in the same transaction."""
     with engine.begin() as conn:
-        return permissions.replace_document_acl(conn, doc_id, acl)
+        changed = permissions.replace_document_acl(conn, doc_id, acl)
+        if changed:
+            write_admin_event(
+                conn, event="acl_change", user_id=admin_user_id, doc_id=uuid.UUID(doc_id)
+            )
+        return changed
 
 
-def delete_document(engine: Engine, doc_id: str, index_path: Path, dim: int) -> bool:
+def delete_document(
+    engine: Engine, doc_id: str, index_path: Path, dim: int, admin_user_id: str
+) -> bool:
     """Soft delete (the security guarantee), then remove vectors (cleanup). §6.7.
 
     Returns False if the document does not exist or is already deleted.
@@ -51,6 +59,7 @@ def delete_document(engine: Engine, doc_id: str, index_path: Path, dim: int) -> 
             )
             if res.rowcount == 0:
                 return False
+            write_admin_event(conn, event="delete", user_id=admin_user_id, doc_id=parsed)
             ids = [
                 int(r[0])
                 for r in conn.execute(
@@ -71,25 +80,50 @@ def delete_document(engine: Engine, doc_id: str, index_path: Path, dim: int) -> 
     return True
 
 
-def list_documents(engine: Engine, status: str | None) -> list[dict[str, Any]]:
-    stmt = select(
-        documents.c.doc_id,
-        documents.c.filename,
-        documents.c.status,
-        documents.c.failure_reason,
-        documents.c.page_count,
-    ).where(documents.c.deleted_at.is_(None))
-    if status:
-        stmt = stmt.where(documents.c.status == status)
+def document_summary(engine: Engine) -> dict[str, int]:
+    """Counts for the admin summary chips: all live files, processing, needs attention."""
+    sql = text(
+        "SELECT count(*) AS total, "
+        "count(*) FILTER (WHERE status = 'pending') AS processing, "
+        "count(*) FILTER (WHERE status = 'failed') AS failed "
+        "FROM documents WHERE deleted_at IS NULL"
+    )
     with engine.connect() as conn:
-        rows = conn.execute(stmt.order_by(documents.c.filename)).all()
+        row = conn.execute(sql).one()
+    return {"total": int(row.total), "processing": int(row.processing), "failed": int(row.failed)}
+
+
+def list_documents(
+    engine: Engine,
+    *,
+    q: str | None,
+    status: str | None,
+    after: tuple[str, str] | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """BE-12: metadata only (never page or chunk text)."""
+    with engine.connect() as conn:
+        rows = permissions.list_documents_admin(conn, q=q, status=status, after=after, limit=limit)
     return [
         {
-            "doc_id": str(r.doc_id),
+            "doc_id": r.doc_id,
             "filename": r.filename,
+            "page_count": r.page_count,
             "status": r.status,
             "failure_reason": r.failure_reason,
-            "page_count": r.page_count,
+            "groups": list(r.groups),
+            "users": list(r.users),
+            "uploaded_by": r.uploaded_by,
+            "ingested_at": r.ingested_at,
+            "upload": None
+            if r.job_id is None
+            else {
+                "job_id": r.job_id,
+                "status": r.job_status,
+                "pages_done": r.pages_done,
+                "pages_total": r.pages_total,
+                "failure_reason": r.job_failure_reason,
+            },
         }
         for r in rows
     ]

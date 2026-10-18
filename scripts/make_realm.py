@@ -76,9 +76,53 @@ def realm(*, dev: bool) -> dict[str, object]:
                         },
                     }
                 ],
-            }
+            },
+            web_client(dev=dev),
         ],
         "users": users,
+    }
+
+
+AUDIENCE_MAPPER = {
+    "name": "audience-loanrag-api",
+    "protocol": "openid-connect",
+    "protocolMapper": "oidc-audience-mapper",
+    "consentRequired": False,
+    "config": {
+        "included.client.audience": "loanrag-api",
+        "id.token.claim": "false",
+        "access.token.claim": "true",
+        "introspection.token.claim": "true",
+    },
+}
+
+
+def web_client(*, dev: bool) -> dict[str, object]:
+    """BE-5: the browser app's client. Public, Standard Flow with PKCE S256 only, no Direct
+    Access Grants, exact redirect URIs and web origins, `loanrag-api` in the token audience.
+
+    The development realm allows only https://localhost. The production realm reads the
+    public origin from ${LOANRAG_PUBLIC_ORIGIN}, which Keycloak substitutes at import time.
+    """
+    origin = "https://localhost" if dev else "${LOANRAG_PUBLIC_ORIGIN}"
+    return {
+        "clientId": "loanrag-web",
+        "name": "LoanLens web app",
+        "enabled": True,
+        "publicClient": True,
+        "protocol": "openid-connect",
+        "standardFlowEnabled": True,
+        "implicitFlowEnabled": False,
+        "directAccessGrantsEnabled": False,
+        "serviceAccountsEnabled": False,
+        "frontchannelLogout": True,
+        "redirectUris": [f"{origin}/*"],
+        "webOrigins": [origin],
+        "attributes": {
+            "pkce.code.challenge.method": "S256",
+            "post.logout.redirect.uris": f"{origin}##{origin}/*",
+        },
+        "protocolMappers": [AUDIENCE_MAPPER],
     }
 
 

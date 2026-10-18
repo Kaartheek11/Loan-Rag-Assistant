@@ -39,6 +39,42 @@
           }
         }
       ]
+    },
+    {
+      "clientId": "loanrag-web",
+      "name": "LoanLens web app",
+      "enabled": true,
+      "publicClient": true,
+      "protocol": "openid-connect",
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "frontchannelLogout": true,
+      "redirectUris": [
+        "${LOANRAG_PUBLIC_ORIGIN}/*"
+      ],
+      "webOrigins": [
+        "${LOANRAG_PUBLIC_ORIGIN}"
+      ],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "${LOANRAG_PUBLIC_ORIGIN}##${LOANRAG_PUBLIC_ORIGIN}/*"
+      },
+      "protocolMappers": [
+        {
+          "name": "audience-loanrag-api",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "loanrag-api",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
     }
   ],
   "users": [

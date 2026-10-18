@@ -1,5 +1,11 @@
-# TLS reverse proxy (S3). Only the API is routed; Keycloak's admin console is never
-# exposed through Caddy (S15) — Keycloak is reachable on 127.0.0.1:8080 only.
+# Single origin for the app, the API, and Keycloak (extension.md BE-7, §11.2, §11.3).
+#
+#   POST /v1/admin/uploads  -> api:8000, 55 MB body limit
+#   /v1/*, /health          -> api:8000, 1 MB body limit
+#   /auth/admin/*,          -> blocked (404): the Keycloak admin console and its sign-in
+#   /auth/realms/master/*      realm are never exposed (S15)
+#   /auth/*                 -> keycloak:8080
+#   everything else         -> built frontend, falling back to index.html for client routes
 #
 # For a real host name, replace `localhost` with it and Caddy obtains a certificate.
 # `localhost` uses Caddy's internal CA (trust it with `caddy trust`, or curl -k in dev).
@@ -10,20 +16,57 @@
 localhost {
 	encode gzip
 
-	@api path /v1/* /health /docs /openapi.json
-	handle @api {
-		reverse_proxy api:8000
-	}
-
-	handle {
-		respond "not found" 404
-	}
-
 	header {
 		Strict-Transport-Security "max-age=31536000"
 		X-Content-Type-Options "nosniff"
 		Referrer-Policy "no-referrer"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
 		-Server
+	}
+
+	@upload {
+		method POST
+		path /v1/admin/uploads
+	}
+	handle @upload {
+		request_body {
+			max_size 55MB
+		}
+		reverse_proxy api:8000
+	}
+
+	@api path /v1/* /health
+	handle @api {
+		request_body {
+			max_size 1MB
+		}
+		reverse_proxy api:8000
+	}
+
+	# The admin console and the master realm (admin sign-in) stay on 127.0.0.1:8080 (S15).
+	@kcadmin path /auth/admin /auth/admin/* /auth/realms/master /auth/realms/master/*
+	handle @kcadmin {
+		respond 404
+	}
+
+	handle /auth/* {
+		reverse_proxy keycloak:8080
+	}
+
+	# keycloak-js loads this page in a same-origin iframe for the silent SSO check, so it
+	# alone may be framed by this origin; every other app route keeps frame-ancestors 'none'.
+	@silentsso path /silent-check-sso.html /silent-check-sso.js
+	handle @silentsso {
+		header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src 'self'; frame-src 'self'; frame-ancestors 'self'; base-uri 'self'; form-action 'self'"
+		root * /srv/frontend
+		file_server
+	}
+
+	handle {
+		header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src 'self'; frame-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+		root * /srv/frontend
+		try_files {path} /index.html
+		file_server
 	}
 }
 

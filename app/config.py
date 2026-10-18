@@ -36,6 +36,8 @@ class Settings(BaseSettings):
     audit_hmac_key: SecretStr | None = None
 
     embedding_model: str = "BAAI/bge-small-en-v1.5"
+    # cpu (default, deterministic) or a GPU device such as mps/cuda for faster bulk ingestion.
+    embedding_device: Literal["cpu", "mps", "cuda"] = "cpu"
     faiss_index_path: str = "./data/index.faiss"
     document_store_path: str = "./data/documents"
 

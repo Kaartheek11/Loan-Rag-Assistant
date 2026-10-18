@@ -67,10 +67,27 @@ def is_heading(line: str) -> bool:
     letters = [ch for ch in s if ch.isalpha()]
     if len(letters) < 3:
         return False
+    # Mostly letters: keeps table rows such as "2023-04-01 $1,200.00 PAID" from counting.
+    if len(letters) / len(s.replace(" ", "")) < 0.5:
+        return False
     if all(ch.isupper() for ch in letters):
         return True
+    if any(ch.isdigit() for ch in s):  # title-case lines with figures are table rows
+        return False
     words = [w for w in re.split(r"\s+", s) if w[:1].isalpha()]
     return bool(words) and all(w[0].isupper() for w in words) and not s.endswith(".")
+
+
+def section_label(heading: str) -> str:
+    """Readable section name: an all-caps heading becomes sentence case ("Bank statements")."""
+    h = heading.strip().rstrip(":").strip()
+    letters = [ch for ch in h if ch.isalpha()]
+    if letters and all(ch.isupper() for ch in letters):
+        words = h.split()
+        out = [w if any(c.isdigit() for c in w) else w.lower() for w in words]
+        out[0] = out[0][:1].upper() + out[0][1:]
+        return " ".join(out)
+    return h
 
 
 def split_sentences(block: str) -> list[str]:
@@ -115,7 +132,7 @@ def _page_units(
     for line in text.splitlines():
         if is_heading(line):
             flush()
-            heading = line.strip().rstrip(":").strip() or heading
+            heading = section_label(line) or heading
             units.append(_Unit(line.strip(), count(line), heading))
         else:
             block.append(line.strip())

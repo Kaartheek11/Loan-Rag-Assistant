@@ -83,12 +83,20 @@ uv run python -m app.cli ingest --source ./corpus --acl-config ./config/acl_seed
 Inside Compose the same commands run in the API container:
 `docker compose -f docker/docker-compose.yml run --rm api python -m app.cli ingest --source /corpus --acl-config /app/config/acl_seed.yaml`.
 
+### Keycloak admin console
+
+Open **http://localhost:8080** (it redirects to `/auth/admin/`) and sign in with
+`KEYCLOAK_ADMIN` / `KEYCLOAK_ADMIN_PASSWORD` from `.env`. The console and its sign-in page are
+served only on this localhost-bound port. Through Caddy, `https://localhost/auth/admin/*` and
+`https://localhost/auth/realms/master/*` return 404. The `keycloak-init` service keeps the
+admin sign-in on port 8080 each time Keycloak starts.
+
 ### Get a token
 
 **Keycloak (development, Direct Access Grants enabled only in the dev realm):**
 
 ```bash
-TOKEN=$(curl -s http://localhost:8080/realms/loanrag/protocol/openid-connect/token \
+TOKEN=$(curl -s http://localhost:8080/auth/realms/loanrag/protocol/openid-connect/token \
   -d grant_type=password -d client_id=loanrag-api \
   -d username=alice -d password="$DEV_USER_PASSWORD" | jq -r .access_token)
 ```
@@ -101,15 +109,19 @@ uv run python -m app.cli gen-test-keys                  # ./keys (git-ignored)
 TOKEN=$(uv run python -m app.cli mint-token --user u_alice)
 ```
 
-### Try it in the browser
+### API docs page (developers)
 
-There is no UI beyond FastAPI's docs page (spec §3). With the stack running:
+End users use the web app ([LoanLens](#loanlens-the-web-app-version-2)). Caddy only routes
+`/v1/*` and `/health` to the API, so FastAPI's docs page is available when you run the API
+directly (`uv run uvicorn --factory app.api.main:app_factory --port 8000`) at
+`http://localhost:8000/docs`:
 
-1. `scripts/token.sh carol` prints a 15-minute Keycloak token.
-2. Open `https://localhost/docs`, click **Authorize**, and paste the token.
+1. `scripts/token.sh carol` prints a 15-minute Keycloak token (dev password grant).
+2. Open the docs page, click **Authorize**, and paste the token.
 3. Use `POST /v1/query`, then `GET /v1/documents/{doc_id}/pages/{page}` to open a cited page.
 
-To add documents, copy PDFs into `./corpus`, give each one an ACL entry in
+To add documents from the command line (admins can also upload in the app), copy PDFs into
+`CORPUS_DIR`, give each one an ACL entry in
 `config/acl_seed.yaml` (no entry means nobody can see it), and run
 `docker compose … run --rm --no-deps api python -m app.cli ingest --source /corpus --acl-config /app/config/acl_seed.yaml`.
 The API picks up the new index version on its next query.
@@ -151,6 +163,72 @@ uv run python -m app.cli eval --provider fake           # retrieval metrics + pi
 uv run python -m app.cli eval --provider ollama
 uv run python -m app.cli eval --provider hosted         # throttled: EVAL_REQUESTS_PER_MINUTE
 ```
+
+## LoanLens: the web app (version 2)
+
+Version 2 adds a browser app with sign-in, a dashboard and a chat window, plus admin uploads,
+on top of the API. Its spec is [`extension.md`](extension.md). Corpus files are now 50–100 pages
+each.
+
+### Open the app
+
+1. Start the stack (above; on macOS use the `host-ollama` override and run `ollama serve`).
+2. Open **https://localhost**. Caddy uses a local certificate, so accept the browser warning
+   once, or run `caddy trust`.
+3. Click **Sign in**. You land on Keycloak's sign-in page, served from the same origin under
+   `/auth`. The password for every demo user is `DEV_USER_PASSWORD` in your `.env`.
+4. After "Checking your access", the dashboard shows who you are, your access groups and how
+   many loan files you can read. Ask a question that names a loan number, then click a
+   citation chip to open the page with the cited passage highlighted.
+
+### Demo users and their access
+
+Counts are for the generated corpus (seed 42), before any uploads.
+
+| Username | Groups | Role | Readable loan files |
+|---|---|---|---|
+| `alice` | Underwriting, Western region | | 402 |
+| `bob` | Servicing | | 207 |
+| `carol` | Compliance, Eastern region | | 357 |
+| `dana` | Servicing (+ individual grants) | | 224 |
+| `erin` | Executive | | 199 |
+| `frank` | Underwriting, Eastern region | | 369 |
+| `grace` | Western region | | 228 |
+| `ivan` | Compliance | | 198 |
+| `henry` | none | | 0 |
+| `admin` | none | admin | 0 (admins manage files but cannot read them) |
+
+### Upload loan files (admins)
+
+Sign in as `admin`, then open **Manage files**. Click **Upload files**, drop up to 20 PDFs
+(50 MB each), and choose who can read them. Files upload two at a time and move through
+Uploading → Waiting → Processing (page X of Y) → Ready. Progress continues in the Uploads tray
+if you close the dialog. From the table you can edit a file's access, retry a failed upload or
+delete a file. The `worker` service does the processing, with the same pipeline as the CLI.
+
+### Frontend development
+
+```bash
+cd frontend
+npm ci
+npm run lint && npm run typecheck && npm test   # ESLint, tsc (strict), Vitest + RTL + MSW
+npm run build                                   # production build (also built in Docker, target `web`)
+npm run e2e                                     # Playwright + axe against the running stack
+```
+
+The end-to-end suite (UI-T1 to UI-T22) needs the full stack with the corpus ingested. It signs
+in through the real Keycloak page, uploads fresh fixture PDFs on each run, and temporarily
+changes state it restores afterwards: group memberships and the realm's token lifespan.
+
+### macOS notes
+
+- Docker on macOS has no GPU, so run Ollama natively and use
+  `docker/docker-compose.host-ollama.yml`.
+- Keep generated data outside iCloud-synced folders: set `CORPUS_DIR` and `APP_DATA_DIR` in
+  `.env` (for example `~/loanrag-data/corpus` and `~/loanrag-data/data`). iCloud-evicted files
+  cannot be read through Docker mounts.
+- Bulk ingestion is fastest on the host with `EMBEDDING_DEVICE=mps` and
+  `ingest --workers 6`. The containers then share the index through `APP_DATA_DIR`.
 
 ## Development
 

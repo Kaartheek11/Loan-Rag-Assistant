@@ -7,8 +7,10 @@ ignored. The algorithm is pinned to RS256 everywhere (no HS256, no `none`).
 
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -108,6 +110,10 @@ class TokenVerifier:
 
     def verify(self, token: str) -> str:
         """Return the verified `sub` (user_id) or raise AuthError."""
+        return self.verify_with_token_id(token)[0]
+
+    def verify_with_token_id(self, token: str) -> tuple[str, str]:
+        """Return (sub, token_id). token_id is the `jti` claim, or a hash of the token."""
         try:
             header = jwt.get_unverified_header(token)
         except jwt.PyJWTError as exc:
@@ -136,7 +142,11 @@ class TokenVerifier:
         sub = claims.get("sub")
         if not isinstance(sub, str) or not sub:
             raise AuthError("missing_sub")
-        return sub
+        jti = claims.get("jti")
+        token_id = (
+            jti if isinstance(jti, str) and jti else hashlib.sha256(token.encode()).hexdigest()
+        )
+        return sub, token_id
 
 
 def _pem_to_jwk(pem: str) -> str:
@@ -182,6 +192,7 @@ def mint_token(
         "aud": audience,
         "iat": now,
         "exp": now + lifetime_seconds,
+        "jti": str(uuid.uuid4()),
     }
     claims.update(extra_claims or {})
     return jwt.encode(claims, private_key_pem, algorithm=ALGORITHM, headers={"kid": kid})

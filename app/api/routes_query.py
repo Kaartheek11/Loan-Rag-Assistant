@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Any
 
 from fastapi import APIRouter, Depends, Request
@@ -24,7 +25,10 @@ def build_router(limiter: Limiter, limit: str) -> APIRouter:
         state = request.app.state
         top_k = body.top_k or state.settings.top_k_default
         outcome = await run_in_threadpool(
-            state.query_service.answer, identity, body.question, top_k
+            partial(state.query_service.answer, request_id=request.state.request_id),
+            identity,
+            body.question,
+            top_k,
         )
         response: dict[str, Any] = outcome.response_body()
         return response
