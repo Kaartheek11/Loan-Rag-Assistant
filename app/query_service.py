@@ -29,9 +29,7 @@ log = structlog.get_logger(__name__)
 # One fixed wording for every insufficient case (nothing visible matched, the model found no
 # answer, or citations failed twice), so it never reveals whether a hidden file matched (§6.6).
 # Wording changed from task.md §9.2 at the owner's request (architecture D58).
-INSUFFICIENT_ANSWER = (
-    "I couldn't find information to answer that in the files you have access to."
-)
+INSUFFICIENT_ANSWER = "I couldn't find information to answer that in the files you have access to."
 
 
 class ServiceUnavailable(RuntimeError):
